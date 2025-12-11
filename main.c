@@ -31,11 +31,7 @@
 #include "apds9960.h"
 
 
-
-// NOTE might need something called image.h but who knows
-
 #include "ui.h"
-//#include "ili9488.c"
 
 /* USER CODE END Includes */
 
@@ -57,10 +53,6 @@ volatile uint32_t g_samples_played = 0;  // samples in *current song*
 volatile uint32_t g_last_samples_played = 0;  // samples in *current song*
 
 volatile uint32_t g_ms_since_song_start = 0; // optional, derived in main
-
-//#define BYTES_PER_PIXEL 2
-
-//#define BUF1_SIZE (RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL)
 
 /* USER CODE END PD */
 
@@ -132,26 +124,26 @@ static void MX_LPUART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-
 #define BUF_SIZE 2048
 #define HALF 1024
 #define TIMEOUT 1000
-uint8_t rx_buffer[BUF_SIZE] = {0};
 int playing = 0; //initial flag - have we started the process?
 int paused = 0;
 int accel = 0;
 int terminated = 0;
 int first_half = 0;
 int audio_received = 0; //flag - have we received any subsequent data since last callback?
+int fft_ready = 0;
+
 uint8_t next_cmd = 'S';
+uint8_t rx_buffer[BUF_SIZE] = {0};
+uint8_t skip_requested = 0;
+
 
 float volume = 2.0f;
 const float VOL_MIN = 0.5f;			// MAYBE [0,5] with different speaker
 const float VOL_MAX = 3.5f;
 const float VOL_STEP = 0.5f;
-
-float32_t pcm_float[HALF];
-
 float speed = 0.0f;
 const float SPEED_STEP = 0.2f;
 const float SPEED_MAX = 1.6f;
@@ -159,13 +151,11 @@ const float SPEED_MIN = -1.6f;
 const float MULT_MIN = 0.25f;   // or 0.5f
 const float MULT_MAX = 4.0f;
 
+float32_t pcm_float[HALF];
 float32_t fft_input[FFT_SIZE];    // time-domain samples (copied from rx_buffer)
 float32_t fft_output[FFT_SIZE];   // freq-domain complex output
 float32_t fft_mag[FFT_SIZE/2] = {0};    // magnitude of first N/2 bins
 arm_rfft_fast_instance_f32 fft_instance;
-int fft_ready = 0;
-
-uint8_t skip_requested = 0;
 
 typedef struct {
 	const char *title;
@@ -173,6 +163,8 @@ typedef struct {
 	uint16_t bpm;
 	uint16_t duration;
 } SongMetaData;
+
+#define NUM_SONGS	13
 
 const SongMetaData g_songs[13] = {
 		[1] = {"Espresso", "Sabrina Carpenter", 104, 175},
@@ -189,35 +181,8 @@ const SongMetaData g_songs[13] = {
 		[12] = {"Promise", "Laufey", 76, 234},
 };
 
-
-
-//void ReadHeaderFromHost(void) {
-//   char buf[2];
-//   uint8_t ch;
-//   int idx = 0;
-//
-//   	   int song_idx = 0;
-//       g_current = (uint16_t)song_idx;
-//       // pull metadata from local table
-//       g_bpm = g_songs[g_current].bpm;
-//       // pick LED mode based on BPM
-//		if (g_bpm < 100) {
-//			g_led_mode = LED_MODE_SLOW_BLUE;
-//		} else if (g_bpm >= 100 && g_bpm <= 129) {
-//			g_led_mode = LED_MODE_WARM_FADE;
-//		} else if (g_bpm >= 130 && g_bpm <= 150) {
-//			g_led_mode = LED_MODE_PINK_FLASH;
-//		} else if (g_bpm > 150) {
-//			g_led_mode = LED_MODE_RAINBOW_ROAD;
-//		} else {
-//			// any “gap” like 121–129 if you want them off / neutral
-//			g_led_mode = LED_MODE_OFF;
-//		}
-////   } else {
-////       // invalid header → turn off LEDs by default
-////       g_led_mode = LED_MODE_OFF;
-////   }
-//}
+uint16_t g_current = 0;
+uint16_t g_bpm = 0;
 
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
 {
@@ -230,15 +195,8 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 
     uint16_t w = (uint16_t)(area->x2 - area->x1 + 1);
     uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
-//    for(y = area->y1; y <= area->y2; y++) {
-//        for(x = area->x1; x <= area->x2; x++) {
-//        	LCD_IO_WriteCmd8MultipleData8(ILI9488_MADCTL, (uint8_t *)buf16, 1); // HELP, aeguments are addr offset(the ili9488 defines) data size
-//        	ili9488_WritePixel(x, y, *buf16);
-//            buf16++;
-//        }
-//    }
-    ili9488_DrawRGBImage(area->x1, area->y1, w, h, buf16);
 
+    ili9488_DrawRGBImage(area->x1, area->y1, w, h, buf16);
 
     /* IMPORTANT!!!
      * Inform LVGL that flushing is complete so buffer can be modified again. */
@@ -247,8 +205,6 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 
 // create a global array of page names
 // display the next page when this is called
-
-
 static lv_obj_t *get_root_for_screen(enum ScreensEnum screen) {
     switch (screen) {
         case SCREEN_ID_ESPRESSO:          return objects.espresso;
@@ -342,9 +298,6 @@ static void update_play_pause_button(enum ScreensEnum screen) {
         printf("changing to pause pic\n\r");
         lv_imagebutton_set_state(btn, LV_IMAGEBUTTON_STATE_RELEASED);
     }
-
-    // (optional) force redraw if you want to be extra sure
-    // lv_obj_invalidate(btn);
 }
 
 
@@ -372,8 +325,6 @@ static void update_left_right_gesture(enum ScreensEnum screen, bool is_left, cha
 	   else if (dir == 'd'){
 		   lv_imagebutton_set_state(btn, LV_IMAGEBUTTON_STATE_CHECKED_PRESSED);
 	   }
-
-
 }
 
 static void update_volume_arc(enum ScreensEnum screen, int volume) {
@@ -384,7 +335,6 @@ static void update_volume_arc(enum ScreensEnum screen, int volume) {
 	lv_arc_set_value(arc, scaled_volume);
 
 }
-
 
 float map_speed_to_multiplier(float speed)
 {
@@ -405,18 +355,15 @@ float map_speed_to_multiplier(float speed)
     return mult;
 }
 
-
-
 static void update_speed_label(enum ScreensEnum screen, int speed) {
     lv_obj_t *label = get_obj_for_screen(screen, 5);
 
     float multiplier = map_speed_to_multiplier(speed);
     char buf[32];
-    snprintf(buf, sizeof(buf), "Speed:\n%.2f", multiplier);
+    snprintf(buf, sizeof(buf), "Speed:\n%f", speed);
 
     lv_label_set_text(label, buf);
 }
-
 
 
 
@@ -440,7 +387,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin) {
 	//disableGesture();
 }
 
-
 static void RequestNextChunk(uint8_t *dest) {
 	if (paused) {
 	        // Don’t ask Python for more audio while paused
@@ -461,13 +407,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (!playing) {
       HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t*)rx_buffer, BUF_SIZE, DAC_ALIGN_8B_R);
       HAL_TIM_Base_Start(&htim5);
-      //uart buffer is empty so we're filling it again
-//      const uint8_t S = 'S';
-//      HAL_UART_Transmit(&huart2, &S, 1, TIMEOUT);
-//      HAL_UART_Receive_DMA(&huart2, &rx_buffer[HALF], HALF);
       RequestNextChunk(&rx_buffer[HALF]);
       playing = 1;
-      }
+  }
   audio_received = 1;
 }
 
@@ -491,6 +433,7 @@ void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac)
           fft_input[i] = ((float)rx_buffer[HALF + i] - 128.0f) / 128.0f;
 
       }
+
       fft_ready = 1;
 
       // === CMSIS-DSP FLOAT CONVERSION (second half) ===
@@ -510,8 +453,7 @@ void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac)
       }
 
 	  /* FFT LOGIC END */
-
-      // vol control end
+      /* VOLUME CONTROL END */
 
       g_samples_played += HALF;
 
@@ -534,8 +476,7 @@ void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 	    else {
 
 	  	  /* FFT LOGIC START */
-
-//	         Copy FIRST half (0..511) before reusing it
+	    	// Copy FIRST half (0..511) before reusing it
 	        for (int i = 0; i < FFT_SIZE; i++) {
 	            fft_input[i] = ((float)rx_buffer[i] - 128.0f) / 128.0f;
 	        }
@@ -556,7 +497,7 @@ void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 	                  if (f > 255) f = 255;
 	                  rx_buffer[i] = (uint8_t)f;
 	              }
-	        // vol control end
+	      /* VOLUME CONTROL END */
 	        g_samples_played += HALF;
 
 	  	  /* FFT LOGIC END */
@@ -564,6 +505,47 @@ void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 	    	RequestNextChunk(&rx_buffer[HALF]);
 	    	audio_received = 0;
 	    }
+}
+void ReadHeaderFromHost(void)
+{
+    char buf[32];       // plenty of room: "HDR|123\n\0"
+    uint8_t ch;
+    int idx = 0;
+
+    // Read until newline or buffer full
+    while (idx < (int)(sizeof(buf) - 1)) {
+        if (HAL_UART_Receive(&huart2, &ch, 1, HAL_MAX_DELAY) != HAL_OK) {
+            // UART error, try again
+            continue;
+        }
+        if (ch == '\n') {
+            break;
+        }
+        buf[idx++] = (char)ch;
+    }
+    buf[idx] = '\0';
+
+    int song_idx = 0;   // default if parsing fails
+
+    if (strncmp(buf, "HDR|", 4) == 0) {
+        // parse the integer after "HDR|"
+        song_idx = atoi(&buf[4]);
+    }
+
+    // Clamp to valid range
+    if (song_idx < 0 || song_idx >= NUM_SONGS) {
+        song_idx = 0;
+    }
+
+    // Update global "current song" index
+    g_current = (uint16_t)song_idx;
+
+    // Pull BPM from  metadata table
+    g_bpm = g_songs[g_current].bpm;
+
+    // Optional but super useful for debugging:
+    printf("Header RX: '%s' -> idx=%d, bpm=%d, mode=%d\r\n",
+           buf, song_idx, g_bpm);
 }
 
 /* USER CODE END 0 */
@@ -575,69 +557,58 @@ void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 int main(void)
 {
 
-  /* USER CODE BEGIN 1 */
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
 
-  /* USER CODE BEGIN Init */
+	/* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
+	/* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+	/* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_SPI2_Init();
-  MX_USART2_UART_Init();
-  MX_DAC1_Init();
-  MX_TIM5_Init();
-  MX_TIM2_Init();
-  MX_I2C1_Init();
-  MX_I2C3_Init();
-  MX_LPUART1_UART_Init();
-  /* USER CODE BEGIN 2 */
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_DMA_Init();
+	MX_SPI2_Init();
+	MX_USART2_UART_Init();
+	MX_DAC1_Init();
+	MX_TIM5_Init();
+	MX_TIM2_Init();
+	MX_I2C1_Init();
+	MX_I2C3_Init();
+	MX_LPUART1_UART_Init();
+	/* USER CODE BEGIN 2 */
 
-  ili9488_Init();
-  HAL_UART_Receive_DMA(&huart2, &rx_buffer[0], HALF);
+	ili9488_Init();
 
+	HAL_UART_Receive_DMA(&huart2, &rx_buffer[0], HALF);
 
-//  ReadHeaderFromHost();
+	lv_init();
+	lv_tick_set_cb(HAL_GetTick);
 
+	lv_disp_t * display1 = lv_display_create(RESOLUTION_HORIZONTAL, RESOLUTION_VERTICAL);
+	lv_display_set_rotation(display1, LV_DISPLAY_ROTATION_0); //setting it to LV_DISPLAY_ROTATION_180 made no difference
+	lv_display_set_buffers(display1, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-//  ili9488_DrawHLine(0xFF42, 200, 2, uint16_t Length);
-//  ili9488_FillScreen(0xFFFF);  // white, or use ili9488_DrawRGBImage, etc.
-//
-//  while (1) {
-//	  // do nothing; screen should stay solid, no flicker
-//  }
-////
-  lv_init();
-  lv_tick_set_cb(HAL_GetTick);
+	lv_display_set_flush_cb(display1, my_flush_cb);
 
-  lv_disp_t * display1 = lv_display_create(RESOLUTION_HORIZONTAL, RESOLUTION_VERTICAL);
-  lv_display_set_rotation(display1, LV_DISPLAY_ROTATION_0); //setting it to LV_DISPLAY_ROTATION_180 made no difference
-  lv_display_set_buffers(display1, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
+	ui_init();
 
-  lv_display_set_flush_cb(display1, my_flush_cb);
+	int curr_index = 0;
+	enum ScreensEnum curr_screen = SONG_SCREENS[curr_index];
 
-  ui_init();
-//
-  int curr_index = 0;
-  enum ScreensEnum curr_screen = SONG_SCREENS[curr_index];
-
-
-  sensor_init(&PAUSE_SKIP_Sensor, &hi2c3);
+	sensor_init(&PAUSE_SKIP_Sensor, &hi2c3);
 	sensor_init(&VOLUME_SPEED_Sensor, &hi2c1);
 
 	begin(&PAUSE_SKIP_Sensor);
@@ -645,141 +616,102 @@ int main(void)
 
 	enableGesture(&PAUSE_SKIP_Sensor);
 	enableGesture(&VOLUME_SPEED_Sensor);
-//   load the first screen
-//  loadScreen(SCREEN_ID_HEAVY);
 
-  int curr_progress = 0;
+	int curr_progress = 0;
 
-  // get the bar for the current screen
-  lv_obj_t *bar_obj = get_bar_for_screen(curr_screen);
-  int curr_max_value = lv_bar_get_max_value(bar_obj);
-  lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
+	// get the bar for the current screen
+	lv_obj_t *label_obj = get_obj_for_screen(curr_screen,5);
+	lv_obj_add_flag(label_obj, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_t *bar_obj = get_bar_for_screen(curr_screen);
+	int curr_max_value = lv_bar_get_max_value(bar_obj);
+	lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
 
-  uint32_t last_update = HAL_GetTick();
+	uint32_t last_update = HAL_GetTick();
 
-  arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
+	arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
 
-//  init_matrix_test();
 
-  /* AUDIO LOGIC */
-//  led_render();
-//  HAL_Delay(1000);
-//
-//	matrix_clear();
-//	led_render();
-//	 HAL_Delay(1000);
-	  printf("beginning gesture\n\r");
-
-	  const uint8_t S = 'S';
-	  HAL_UART_Transmit(&huart2, &S, 1, TIMEOUT);
-
+	const uint8_t S = 'S';
+	HAL_UART_Transmit(&huart2, &S, 1, TIMEOUT);
 
   /* USER CODE END 2 */
 
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+	while (1)
+	{
 	  if (fft_ready)
-	 {
+	  {
 		 fft_ready = 0;
+
 		 // 1) Run FFT on fft_input (already filled in callbacks)
 		 arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0); // 0 = forward FFT
+
 		 // 2) Compute magnitude of first N/2 complex bins
 		 // fft_output is [Re0, Im0, Re1, Im1, ..., Re(N/2-1), Im(N/2-1)]
 		 // fft_mag: how strong each frequency is in the audio chunk you just analyzed
 		 arm_cmplx_mag_f32(fft_output, fft_mag, FFT_SIZE/2);
 		 update_fft_bars();
 	 }
-	 		  while (hdma_tim2_ch1.State != HAL_DMA_STATE_READY || wr_buf_p != 0);
-	 		 	 animate_bars_pulse();
-	 		 	 led_render();
+	  while (hdma_tim2_ch1.State != HAL_DMA_STATE_READY || wr_buf_p != 0);
+		 animate_bars_pulse();
+		 led_render();
+
+		 uint32_t time_till_next = lv_timer_handler();
+
+		 uint32_t now = HAL_GetTick();
+
+		 if (now - last_update >= 1000) {
+			  last_update = now;
+
+			  if (!paused) {
+				  uint32_t elapsed_s = Audio_GetElapsedSeconds();
+
+				  // clamp to bar max (which you set to song duration)
+				  if (elapsed_s > (uint32_t)curr_max_value) {
+					  elapsed_s = (uint32_t)curr_max_value;
+				  }
+				  bar_obj = get_bar_for_screen(curr_screen);
+				  curr_progress = elapsed_s;
+				  lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
+			  }
+
+			  // treat "bar is at max" as end-of-song
+			  if (curr_progress >= curr_max_value) {
+				  // reached end -> go to next song in playlist
+				  curr_index = (curr_index + 1) % 12;
+				  curr_screen = SONG_SCREENS[curr_index];
+				  loadScreen(curr_screen);
+				  lv_obj_t *label_obj = get_obj_for_screen(curr_screen,5);
+
+				  lv_obj_add_flag(label_obj, LV_OBJ_FLAG_HIDDEN);
 
 
+				  update_play_pause_button(curr_screen);
 
+				  bar_obj = get_bar_for_screen(curr_screen);
+				  if (bar_obj == NULL) {
+					  while (1) {
+						  // mapping bug
+					  }
+				  }
 
-	  uint32_t time_till_next = lv_timer_handler();
-//	  	 HAL_Delay(time_till_next);
+				  curr_max_value = lv_bar_get_max_value(bar_obj);
+				  curr_progress = 0;
+				  g_samples_played = 0;   // <-- reset for new track
 
-		  uint32_t now = HAL_GetTick();
-		  if (now - last_update >= 1000) {
-		      last_update = now;
-
-		      if (!paused) {
-		          uint32_t elapsed_s = Audio_GetElapsedSeconds();
-
-		          // clamp to bar max (which you set to song duration)
-		          if (elapsed_s > (uint32_t)curr_max_value) {
-		              elapsed_s = (uint32_t)curr_max_value;
-		          }
-
-		          curr_progress = elapsed_s;
-		          lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
-		      }
-
-		      // treat "bar is at max" as end-of-song
-		      if (curr_progress >= curr_max_value) {
-		          // reached end -> go to next song in playlist
-		          curr_index = (curr_index + 1) % NUM_SONGS;
-		          curr_screen = SONG_SCREENS[curr_index];
-		          loadScreen(curr_screen);
-
-		          update_play_pause_button(curr_screen);
-
-		          bar_obj = get_bar_for_screen(curr_screen);
-		          if (bar_obj == NULL) {
-		              while (1) {
-		                  // mapping bug
-		              }
-		          }
-
-		          curr_max_value = lv_bar_get_max_value(bar_obj);
-		          curr_progress = 0;
-		          g_samples_played = 0;   // <-- reset for new track
-
-		          lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
-		      }
+				  lv_bar_set_value(bar_obj, curr_progress, LV_ANIM_OFF);
+			  }
 		  }
 
 
 		  if(gestureAvailable(&PAUSE_SKIP_Sensor)) {
-		  	  		 int gesture2 = readGesture(&PAUSE_SKIP_Sensor);
-		  	  		 if(gesture2 != -1) {
-//		  	  			 printf("PAUSE_SKIP Gesture read : %d\n\r", gesture2);
-		  	  		 }
-//		  	  		 if (gesture2 == 1){
-////		  	  			 printf("paused : %d\n\r", paused);
-//		  	  			   if (paused) {
-//		  	  					// was previously paused, now resume
-//		  	  					const uint8_t S = 'S';
-//
-//		  	  				// was prev accelerate now decelerate
-//		  	  					paused = 0;
-//		  	  					HAL_UART_Transmit(&huart2, &S, 1, TIMEOUT);
-//
-//		  	  				}
-//		  	  			   else {
-//		  	  					// was previously playing, now paused
-//		  	  					const uint8_t P= 'P';
-//
-//		  	  					paused = 1;
-//		  	  					HAL_UART_Transmit(&huart2, &P, 1, TIMEOUT);
-//
-//		  	  				}
-//
-//		  	  			  // PAUSE IS ON THE RIGHT
-//		  	  			   /* UPDATE GESTURE ON DISPLAY AND PAUSE PLAY */
-//
-//		  	  				update_left_right_gesture(curr_screen, false, 'd');
-//			  	  		    update_play_pause_button(curr_screen, paused);
-//		  	  		 }
-//
-//		  	  		 else if (gesture2 == 0){
-//		  	  			update_left_right_gesture(curr_screen, false, 'u');
-//		  	  		 }
+					 int gesture2 = readGesture(&PAUSE_SKIP_Sensor);
 
-		  	  		if (gesture2 == 1){
-//		  	  			 printf("paused : %d\n\r", paused);
+					 if(gesture2 != -1) {
+			  	  			 printf("PAUSE_SKIP Gesture read : %d\n\r", gesture2);
+					 }
+
+					 if (gesture2 == 1){
 						   if(!paused){
 								// was previously playing, now paused
 								const uint8_t P= 'P';
@@ -789,16 +721,14 @@ int main(void)
 
 							}
 
-						  // PAUSE IS ON THE RIGHT
+						   // PAUSE IS ON THE RIGHT
 						   /* UPDATE GESTURE ON DISPLAY AND PAUSE PLAY */
-
 							update_left_right_gesture(curr_screen, false, 'd');
 							update_play_pause_button(curr_screen);
 					 }
 
 					 else if (gesture2 == 0){
-						// was previously playing, now paused
-						 if (paused) {
+						 if (paused) { // ws previously playing, now need to pause
 							// was previously paused, now resume
 							const uint8_t S = 'S';
 
@@ -807,112 +737,78 @@ int main(void)
 
 						}
 
-
 						update_left_right_gesture(curr_screen, false, 'u');
 						update_play_pause_button(curr_screen);
 
 					 }
-		  	  		 else if (gesture2 == 2 ) {
-		  	  			 // next_cmd = 'A';
-		  	  			next_cmd = 'B';
-		  	  			curr_index = (curr_index - 1 + NUM_SONGS) % NUM_SONGS;
-		  	  			update_left_right_gesture(curr_screen, false, 'l');
-		  	  			g_samples_played = 0;
 
-		  	  		 }
-		  	  		 else if (gesture2 == 3) {
-		  	  			 // next_cmd = 'D';
-		  	  			skip_requested = 1;
-		  	  			next_cmd = 'K';
-		  	  			update_left_right_gesture(curr_screen, false, 'r');
-		  	  			g_samples_played = 0;
-		  	  		 }
-		  	  }
+					 else if (gesture2 == 2 ) {
+						 // next_cmd = 'A';
+						next_cmd = 'B';
+						curr_index = (curr_index - 1 + 12) % 12;
+						curr_screen = SONG_SCREENS[curr_index];
+						loadScreen(curr_screen);
+						lv_obj_t *label_obj = get_obj_for_screen(curr_screen, 5);
 
-		  	  if(gestureAvailable(&VOLUME_SPEED_Sensor)) {
-//		  		  paused ? printf("is it paused?: yes\n\r") : printf("is it paused?: no\n\r");
-		  		  //printf("is it paused?: %c\n\r", paused ? "yes" : "no");
-		  		  int gesture = readGesture(&VOLUME_SPEED_Sensor);
-//		  		  if(gesture != -1) {
-//		  			  printf("VOLUME_SPEED Gesture read : %d\n\r", gesture);
-//		  	  	  }
-		  			 if (gesture == 0 ) {
-		  			     volume += VOL_STEP;
-		  			     if (volume > VOL_MAX) volume = VOL_MAX;
-		  			     printf("Volume UP: %.2f\n\r", volume);
-		  			     update_volume_arc(curr_screen, volume);
-		  			     update_left_right_gesture(curr_screen, true, 'u');
+						lv_obj_add_flag(label_obj, LV_OBJ_FLAG_HIDDEN);
 
-		  			 }
-		  			 else if (gesture == 1) {
-		  			     volume -= VOL_STEP;
-		  			     if (volume < VOL_MIN) volume = VOL_MIN;
-		  			     printf("Volume DOWN: %.2f\n\r", volume);
+						update_left_right_gesture(curr_screen, false, 'l');
+						g_samples_played = 0;
 
-		  			     update_volume_arc(curr_screen, volume);
-		  			     update_left_right_gesture(curr_screen, true, 'd');
-		  			 }
-		  			 //TEMP
-//		  	  		 if (gesture == 0 || gesture == 1){
-//		  	  			 //printf("paused : %d\n\r", paused);
-//		  	  			   if (paused) {
-//		  	  					// was previously paused, now resume
-//		  	  					const uint8_t P = 'P';
-//
-//		  	  				// was prev accelerate now decelerate
-//		  	  					paused = 1;
-//		  	  					HAL_UART_Transmit(&huart2, &P, 1, TIMEOUT);
-//		  	  					//printf("resume\n\r");
-//		  	  				}
-//		  	  			   else {
-//		  	  					// was previously playing, now paused
-//		  	  					const uint8_t S= 'S';
-//		  	  					paused = 0;
-//		  	  					HAL_UART_Transmit(&huart2, &S, 1, TIMEOUT);
-//		  	  					//printf("paused\n\r");
-//		  	  				}
-//
-//
-//		  	  		 }
-		  		     else if (gesture == 2) {
-		  		    	next_cmd = 'D';
-		  		    	printf("Slowing down\n\r");
-		  		    	if (speed > SPEED_MIN) speed -= SPEED_STEP;
-		  		    	update_speed_label(curr_screen, speed);
-			  	  		update_left_right_gesture(curr_screen, true, 'l');
+					 }
 
-		  			 }
-		  		     else { // GESTURE = 2
-			  				next_cmd = 'A';
-			  		    	if (speed < SPEED_MAX) speed += SPEED_STEP;
-			  		    	update_speed_label(curr_screen, speed);
-
-			  	  		update_left_right_gesture(curr_screen, true, 'r');
-
-
-		  		     }
-		  	  }
-		  	if (skip_requested) {
-		  		 		 			  // reset flag
-				  printf("before skip requested, paused state: %d\n\r", paused);
-				  skip_requested = 0;
-				 curr_index = (curr_index + 1) % NUM_SONGS;
-				  curr_screen = SONG_SCREENS[curr_index];
-				  loadScreen(curr_screen);
-//
-//		 			  const uint8_t K = 'K';
-//		 			  HAL_UART_Transmit(&huart2, &K, 1, TIMEOUT);
-				  g_samples_played = 0;
-//		 			  g_current++;
-//		 			  if (g_current >= NUM_SONGS) {
-//		 				  g_current = 0; // cirlce around to song1
-//		 			  }
-
-
+					 else if (gesture2 == 3) {
+						 // next_cmd = 'D';
+						skip_requested = 1;
+						next_cmd = 'K';
+						update_left_right_gesture(curr_screen, false, 'r');
+						g_samples_played = 0;
+					 }
 			  }
-  }
 
+			  if(gestureAvailable(&VOLUME_SPEED_Sensor)) {
 
+				  int gesture = readGesture(&VOLUME_SPEED_Sensor);
+
+				  if (gesture == 0 ) {
+						 volume += VOL_STEP;
+						 if (volume > VOL_MAX) volume = VOL_MAX;
+						 printf("Volume UP: %.2f\n\r", volume);
+						 update_volume_arc(curr_screen, volume);
+						 update_left_right_gesture(curr_screen, true, 'u');
+				  }
+				  else if (gesture == 1) {
+						volume -= VOL_STEP;
+						if (volume < VOL_MIN) volume = VOL_MIN;
+						printf("Volume DOWN: %.2f\n\r", volume);
+						update_volume_arc(curr_screen, volume);
+						update_left_right_gesture(curr_screen, true, 'd');
+					 }
+
+				  else if (gesture == 2) {
+						next_cmd = 'D';
+			  		    printf("Slowing down\n\r");
+						if (speed > SPEED_MIN) speed -= SPEED_STEP;
+						update_left_right_gesture(curr_screen, true, 'l');
+				  }
+
+				  else { // GESTURE = 2
+						next_cmd = 'A';
+						if (speed < SPEED_MAX) speed += SPEED_STEP;
+						update_left_right_gesture(curr_screen, true, 'r');
+				  }
+			  }
+			if (skip_requested) {
+				printf("before skip requested, paused state: %d\n\r", paused);
+				skip_requested = 0; // reset flag
+				curr_index = (curr_index + 1) % 12;
+				curr_screen = SONG_SCREENS[curr_index];
+				loadScreen(curr_screen);
+				lv_obj_t *label_obj = get_obj_for_screen(curr_screen, 5);
+				lv_obj_add_flag(label_obj, LV_OBJ_FLAG_HIDDEN);
+				g_samples_played = 0;
+			}
+	}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
